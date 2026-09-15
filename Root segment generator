@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""
+ROI Cropper - GUI tool to upload a high-resolution image or a folder of images,
+place fixed-size ROI boxes, and export them individually or in batch.
+"""
+
+import os
+import glob
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
+
+MAX_CANVAS_W = 1000
+MAX_CANVAS_H = 800
+
+ROI_OUTLINE_NORMAL = "#00c853"
+ROI_OUTLINE_SELECTED = "#ff3d00"
+ROI_FILL_STIPPLE = "gray25"
+
+class ROI:
+    """A single Region-of-Interest, stored in FULL-RESOLUTION image pixel coords."""
+    def __init__(self, roi_id, x, y, size_px):
+        self.id = roi_id
+        self.x = x
+        self.y = y
+        self.size_w = size_px
+        self.size_h = size_px
+        self.rect_item = None
+        self.text_item = None
+
+class ROICropperApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ROI Batch Cropper")
+        self.root.geometry("1400x850")
+
+        # State
+        self.original_image = None
+        self.image_path = None
+        self.base_name = None
+        self.ext = None
+        self.display_photo = None
+        self.scale = 1.0
+        self.rois = []
+        self.next_roi_id = 1
+        self.selected_roi = None
+        self.drag_offset = (0, 0)
+        self.output_folder = None
+        
+        # Batch state
+        self.batch_images = []
+        self.current_image_index = -1
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        # LEFT PANEL - Controls
+        left_panel = ttk.Frame(self.root, padding=10, width=300)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y)
+        
+        # 1. Input Section
+        input_frame = ttk.LabelFrame(left_panel, text="1. Input", padding=10)
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Button(input_frame, text="Load Single Image", command=self.load_image).pack(fill=tk.X, pady=2)
+        ttk.Button(input_frame, text="Load Input Folder (Batch)", command=self.load_folder).pack(fill=tk.X, pady=2)
+        
+        self.file_label = ttk.Label(input_frame, text="No file loaded", wraplength=250)
+        self.file_label.pack(pady=5)
+        
+        nav_frame = ttk.Frame(input_frame)
+        nav_frame.pack(fill=tk.X)
+        ttk.Button(nav_frame, text="<< Prev", command=self.prev_image).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(nav_frame, text="Next >>", command=self.next_image).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+
+        # 2. ROI Configuration
+        config_frame = ttk.LabelFrame(left_panel, text="2. ROI Settings", padding=10)
+        config_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(config_frame, text="DPI:").grid(row=0, column=0, sticky="w", pady=2)
+        self.dpi_var = tk.StringVar(value="1200")
+        ttk.Entry(config_frame, textvariable=self.dpi_var, width=10).grid(row=0, column=1, pady=2)
+
+        ttk.Label(config_frame, text="Width (cm):").grid(row=1, column=0, sticky="w", pady=2)
+        self.w_cm_var = tk.StringVar(value="2.0")
+        ttk.Entry(config_frame, textvariable=self.w_cm_var, width=10).grid(row=1, column=1, pady=2)
+
+        ttk.Label(config_frame, text="Height (cm):").grid(row=2, column=0, sticky="w", pady=2)
+        self.h_cm_var = tk.StringVar(value="2.0")
+        ttk.Entry(config_frame, textvariable=self.h_cm_var, width=10).grid(row=2, column=1, pady=2)
+
+        ttk.Label(config_frame, text="Segments:").grid(row=3, column=0, sticky="w", pady=2)
+        self.count_var = tk.StringVar(value="4")
+        ttk.Entry(config_frame, textvariable=self.count_var, width=10).grid(row=3, column=1, pady=2)
+
+        # 3. ROI Controls
+        roi_frame = ttk.LabelFrame(left_panel, text="3. Modify ROIs", padding=10)
+        roi_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Button(roi_frame, text="Generate Grid", command=self.generate_rois).pack(fill=tk.X, pady=2)
+        ttk.Button(roi_frame, text="Add 1 ROI", command=self.add_single_roi).pack(fill=tk.X, pady=2)
+        ttk.Button(roi_frame, text="Delete Selected", command=self.delete_selected).pack(fill=tk.X, pady=2)
+        ttk.Button(roi_frame, text="Clear All", command=self.clear_rois).pack(fill=tk.X, pady=2)
+
+        # 4. View Controls
+        view_frame = ttk.LabelFrame(left_panel, text="4. View", padding=10)
+        view_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        view_btn_frame = ttk.Frame(view_frame)
+        view_btn_frame.pack(fill=tk.X)
+        ttk.Button(view_btn_frame, text="Zoom +", command=lambda: self.zoom(1.25)).pack(side=tk.LEFT, expand=True, padx=2)
+        ttk.Button(view_btn_frame, text="Zoom -", command=lambda: self.zoom(0.8)).pack(side=tk.LEFT, expand=True, padx=2)
+        ttk.Button(view_btn_frame, text="Fit", command=self.fit_to_window).pack(side=tk.LEFT, expand=True, padx=2)
+
+        # 5. Export Section
+        export_frame = ttk.LabelFrame(left_panel, text="5. Output", padding=10)
+        export_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Button(export_frame, text="Choose Output Folder", command=self.choose_output_folder).pack(fill=tk.X, pady=2)
+        self.output_label = ttk.Label(export_frame, text="(no folder)", wraplength=250)
+        self.output_label.pack(pady=2)
+        
+        ttk.Button(export_frame, text="Export Current Image", command=self.export_rois).pack(fill=tk.X, pady=(10, 2))
+        
+        # Batch Export Button (Highlighted)
+        style = ttk.Style()
+        style.configure("Accent.TButton", font=("TkDefaultFont", 10, "bold"))
+        ttk.Button(export_frame, text="BATCH EXPORT ALL IMAGES", style="Accent.TButton", command=self.export_batch).pack(fill=tk.X, pady=5)
+
+        # RIGHT PANEL - Canvas
+        right_panel = ttk.Frame(self.root)
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
+
+        self.hbar = ttk.Scrollbar(right_panel, orient=tk.HORIZONTAL)
+        self.vbar = ttk.Scrollbar(right_panel, orient=tk.VERTICAL)
+        self.canvas = tk.Canvas(
+            right_panel,
+            bg="#333333",
+            xscrollcommand=self.hbar.set,
+            yscrollcommand=self.vbar.set,
+        )
+        self.hbar.config(command=self.canvas.xview)
+        self.vbar.config(command=self.canvas.yview)
+
+        self.hbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.canvas.bind("<ButtonPress-1>", self.on_mouse_down)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+
+        # Status Bar
+        self.status_var = tk.StringVar(value="Load an image or folder to begin.")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w")
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    # ------------------------------------------------------------ helpers
+    def get_dpi(self):
+        try:
+            dpi = float(self.dpi_var.get())
+            if dpi <= 0: raise ValueError
+            return dpi
+        except ValueError:
+            messagebox.showerror("Invalid DPI", "Please enter a valid positive DPI value.")
+            return None
+
+    def get_roi_size_px(self):
+        dpi = self.get_dpi()
+        if dpi is None: return None
+        try:
+            w_cm = float(self.w_cm_var.get())
+            h_cm = float(self.h_cm_var.get())
+            if w_cm <= 0 or h_cm <= 0: raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid size", "Please enter valid ROI width/height in cm.")
+            return None
+            
+        px_per_cm = dpi / 2.54
+        w_px = round(w_cm * px_per_cm)
+        h_px = round(h_cm * px_per_cm)
+        return w_px, h_px
+
+    # ------------------------------------------------------------- image loading
+    def load_image(self):
+        path = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"), ("All files", "*.*")],
+        )
+        if not path: return
+        self.batch_images = [path]
+        self.current_image_index = 0
+        self._load_current_image()
+
+    def load_folder(self):
+        folder = filedialog.askdirectory(title="Select Input Folder")
+        if not folder: return
+        
+        valid_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+        files = [os.path.join(folder, f) for f in os.listdir(folder) 
+                 if os.path.splitext(f)[1].lower() in valid_exts]
+        
+        if not files:
+            messagebox.showwarning("No Images", "No supported images found in that folder.")
+            return
+            
+        self.batch_images = sorted(files)
+        self.current_image_index = 0
+        self._load_current_image()
+        self.status_var.set(f"Loaded folder with {len(self.batch_images)} images.")
+
+    def _load_current_image(self, preserve_rois=True):
+        if not self.batch_images or self.current_image_index < 0: return
+        
+        path = self.batch_images[self.current_image_index]
+        try:
+            img = Image.open(path)
+            img.load()
+        except Exception as e:
+            messagebox.showerror("Error loading image", str(e))
+            return
+
+        self.original_image = img
+        self.image_path = path
+        fname = os.path.basename(path)
+        self.base_name, self.ext = os.path.splitext(fname)
+
+        # Prefill DPI if available and user hasn't heavily modified it
+        dpi_info = img.info.get("dpi")
+        if dpi_info and isinstance(dpi_info, (tuple, list)) and len(dpi_info) > 0 and dpi_info[0]:
+            self.dpi_var.set(str(round(dpi_info[0])))
+
+        if not preserve_rois or not self.rois:
+            self.rois = []
+            self.next_roi_id = 1
+            self.selected_roi = None
+
+        self.file_label.config(text=f"({self.current_image_index + 1}/{len(self.batch_images)}) {fname}")
+        self.fit_to_window()
+
+    def next_image(self):
+        if self.batch_images and self.current_image_index < len(self.batch_images) - 1:
+            self.current_image_index += 1
+            self._load_current_image(preserve_rois=True)
+
+    def prev_image(self):
+        if self.batch_images and self.current_image_index > 0:
+            self.current_image_index -= 1
+            self._load_current_image(preserve_rois=True)
+
+    # ------------------------------------------------------------- viewing
+    def fit_to_window(self):
+        if self.original_image is None: return
+        w, h = self.original_image.size
+        
+        # Calculate available canvas size dynamically if possible
+        canvas_w = self.canvas.winfo_width()
+        canvas_h = self.canvas.winfo_height()
+        if canvas_w < 10 or canvas_h < 10:
+            canvas_w, canvas_h = MAX_CANVAS_W, MAX_CANVAS_H
+            
+        scale_w = canvas_w / w
+        scale_h = canvas_h / h
+        self.scale = min(scale_w, scale_h, 1.0)
+        self.redraw()
+
+    def zoom(self, factor):
+        if self.original_image is None: return
+        self.scale *= factor
+        self.scale = max(0.02, min(self.scale, 4.0))
+        self.redraw()
+
+    def redraw(self):
+        self._redraw_background()
+        self._redraw_rois()
+
+    def _redraw_background(self):
+        if self.original_image is None: return
+        w, h = self.original_image.size
+        disp_w = max(1, round(w * self.scale))
+        disp_h = max(1, round(h * self.scale))
+
+        resized = self.original_image.convert("RGB").resize((disp_w, disp_h), Image.LANCZOS)
+        self.display_photo = ImageTk.PhotoImage(resized)
+
+        self.canvas.delete("bg")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.display_photo, tags=("bg",))
+        self.canvas.tag_lower("bg")
+        self.canvas.config(scrollregion=(0, 0, disp_w, disp_h))
+
+    def _redraw_rois(self):
+        self.canvas.delete("roi")
+        self.canvas.delete("roi_label")
+        for roi in self.rois:
+            self._draw_roi(roi)
+
+    # -------------------------------------------------------------- ROIs
+    def generate_rois(self):
+        if self.original_image is None:
+            messagebox.showwarning("No image", "Please upload an image first.")
+            return
+        size = self.get_roi_size_px()
+        if size is None: return
+        w_px, h_px = size
+        
+        try:
+            count = int(self.count_var.get())
+            if count <= 0: raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid count", "Please enter a valid positive number.")
+            return
+
+        img_w, img_h = self.original_image.size
+        if w_px > img_w or h_px > img_h:
+            messagebox.showerror("ROI too large", "Requested ROI size is larger than the image.")
+            return
+
+        self.rois = []
+        self.selected_roi = None
+
+        cols = max(1, int(img_w // (w_px + 10)))
+        step_x = w_px + max(10, int(0.15 * w_px))
+        step_y = h_px + max(10, int(0.15 * h_px))
+
+        for i in range(count):
+            col = i % cols
+            row = i // cols
+            x = min(col * step_x, max(0, img_w - w_px))
+            y = min(row * step_y, max(0, img_h - h_px))
+            
+            roi = ROI(self.next_roi_id, x, y, w_px)
+            roi.size_w = w_px
+            roi.size_h = h_px
+            self.rois.append(roi)
+            self.next_roi_id += 1
+
+        self.redraw()
+        self.status_var.set(f"Generated {count} ROI(s). Drag them into place.")
+
+    def add_single_roi(self):
+        if self.original_image is None: return
+        size = self.get_roi_size_px()
+        if size is None: return
+        w_px, h_px = size
+        img_w, img_h = self.original_image.size
+        
+        offset = (len(self.rois) * 20) % max(1, (img_w - w_px))
+        roi = ROI(self.next_roi_id, offset, offset, w_px)
+        roi.size_w = w_px
+        roi.size_h = h_px
+        self.rois.append(roi)
+        self.next_roi_id += 1
+        self.redraw()
+
+    def clear_rois(self):
+        self.rois = []
+        self.selected_roi = None
+        self.next_roi_id = 1
+        self.redraw()
+
+    def delete_selected(self):
+        if self.selected_roi is None: return
+        self.rois = [r for r in self.rois if r is not self.selected_roi]
+        self.selected_roi = None
+        self.redraw()
+
+    def _draw_roi(self, roi: ROI):
+        x0 = roi.x * self.scale
+        y0 = roi.y * self.scale
+        x1 = (roi.x + roi.size_w) * self.scale
+        y1 = (roi.y + roi.size_h) * self.scale
+        color = ROI_OUTLINE_SELECTED if roi is self.selected_roi else ROI_OUTLINE_NORMAL
+        roi.rect_item = self.canvas.create_rectangle(
+            x0, y0, x1, y1, outline=color, width=2, fill="", tags=("roi", f"roi{roi.id}")
+        )
+        roi.text_item = self.canvas.create_text(
+            x0 + 4, y0 + 4, anchor="nw", text=f"ROI {roi.id}",
+            fill=color, font=("TkDefaultFont", 10, "bold"), tags=("roi_label", f"roi{roi.id}")
+        )
+
+    # ------------------------------------------------------------- mouse
+    def on_mouse_down(self, event):
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        clicked = None
+        for roi in reversed(self.rois):
+            x0, y0 = roi.x * self.scale, roi.y * self.scale
+            x1, y1 = x0 + roi.size_w * self.scale, y0 + roi.size_h * self.scale
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                clicked = roi
+                break
+        self.selected_roi = clicked
+        if clicked is not None:
+            self.drag_offset = (cx - clicked.x * self.scale, cy - clicked.y * self.scale)
+        self._redraw_rois()
+
+    def on_mouse_drag(self, event):
+        if self.selected_roi is None or self.original_image is None: return
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        roi = self.selected_roi
+        img_w, img_h = self.original_image.size
+
+        new_x = (cx - self.drag_offset[0]) / self.scale
+        new_y = (cy - self.drag_offset[1]) / self.scale
+
+        roi.x = max(0, min(new_x, img_w - roi.size_w))
+        roi.y = max(0, min(new_y, img_h - roi.size_h))
+
+        x0, y0 = roi.x * self.scale, roi.y * self.scale
+        x1, y1 = x0 + roi.size_w * self.scale, y0 + roi.size_h * self.scale
+        
+        if roi.rect_item is not None:
+            self.canvas.coords(roi.rect_item, x0, y0, x1, y1)
+        if roi.text_item is not None:
+            self.canvas.coords(roi.text_item, x0 + 4, y0 + 4)
+
+    def on_mouse_up(self, event):
+        pass
+
+    # -------------------------------------------------------------- export
+    def choose_output_folder(self):
+        folder = filedialog.askdirectory(title="Select output folder")
+        if folder:
+            self.output_folder = folder
+            self.output_label.config(text=folder)
+
+    def _save_crops(self, target_image, base_filename, ext_str):
+        """Helper to crop and save the active ROIs for a specific PIL Image"""
+        saved = []
+        errors = []
+        img_w, img_h = target_image.size
+        
+        for roi in self.rois:
+            # Bound constraints (in case batch images have slightly different resolutions)
+            left = max(0, int(round(roi.x)))
+            top = max(0, int(round(roi.y)))
+            right = min(img_w, left + int(roi.size_w))
+            bottom = min(img_h, top + int(roi.size_h))
+
+            try:
+                cropped = target_image.crop((left, top, right, bottom))
+                out_name = f"{base_filename}_roi{roi.id}{ext_str}"
+                out_path = os.path.join(self.output_folder, out_name)
+                
+                save_kwargs = {}
+                dpi_val = self.get_dpi()
+                if dpi_val: save_kwargs["dpi"] = (dpi_val, dpi_val)
+                
+                try:
+                    cropped.save(out_path, **save_kwargs)
+                except Exception:
+                    cropped.save(out_path) 
+                    
+                saved.append(out_name)
+            except Exception as e:
+                errors.append(f"ROI {roi.id} on {base_filename}: {e}")
+                
+        return saved, errors
+
+    def export_rois(self):
+        """Exports ROIs for the currently displayed image only"""
+        if not self._check_export_ready(): return
+
+        ext = self.ext if self.ext else ".png"
+        saved, errors = self._save_crops(self.original_image, self.base_name, ext)
+
+        self._show_export_results(len(saved), errors, "Export Current Complete")
+
+    def export_batch(self):
+        """Exports ROIs applied identically to ALL images in the batch list"""
+        if not self._check_export_ready(): return
+        if not self.batch_images:
+            messagebox.showwarning("No Batch", "Please load an Input Folder first.")
+            return
+
+        total_saved = 0
+        all_errors = []
+
+        for path in self.batch_images:
+            try:
+                img = Image.open(path)
+                fname = os.path.basename(path)
+                base, ext = os.path.splitext(fname)
+                if not ext: ext = ".png"
+                
+                saved, errors = self._save_crops(img, base, ext)
+                total_saved += len(saved)
+                all_errors.extend(errors)
+                img.close()
+            except Exception as e:
+                all_errors.append(f"Failed to open {path}: {e}")
+
+        self._show_export_results(total_saved, all_errors, "Batch Export Complete")
+
+    def _check_export_ready(self):
+        if self.original_image is None:
+            messagebox.showwarning("No image", "Please upload an image first.")
+            return False
+        if not self.rois:
+            messagebox.showwarning("No ROIs", "Generate or add at least one ROI first.")
+            return False
+        if not self.output_folder:
+            messagebox.showwarning("No output folder", "Please choose an output folder first.")
+            return False
+        return True
+        
+    def _show_export_results(self, count, errors, title):
+        msg = f"Successfully exported {count} ROI image(s) to:\n{self.output_folder}"
+        if errors:
+            msg += "\n\nErrors encountered:\n" + "\n".join(errors[:10])
+            if len(errors) > 10: msg += f"\n... and {len(errors) - 10} more."
+            
+        self.status_var.set(f"Exported {count} ROI(s).")
+        messagebox.showinfo(title, msg)
+
+
+def main():
+    root = tk.Tk()
+    app = ROICropperApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
